@@ -21,38 +21,38 @@ import (
 /* ------ MAGIC PACKET PARAMS & UTILS ------ */
 
 type MagicObfsParams struct {
-	Jc   int   // Junk packet count
-	Jmin int   // Junk packet min size
-	Jmax int   // Junk packet max size
-	S1   int   // Init packet junk size
-	S2   int   // Response packet junk size
-	H1   byte  // Init magic header
-	H2   byte  // Response magic header
-	H3   byte  // Underload header (برای دیتا اگر خواستی)
-	H4   byte  // Transport header (برای دیتا اگر خواستی)
+	Jc   int // Junk packet count
+	Jmin int // Junk packet min size
+	Jmax int // Junk packet max size
+	S1   int // Init packet junk size
+	S2   int // Response packet junk size
+	H1   byte // Init magic header
+	H2   byte // Response magic header
+	H3   byte // Underload header
+	H4   byte // Transport header
 }
 
-// مقدار تستی، مقداردهی واقعی را باید در peer.go انجام دهی
+// Test values, actual assignment should be done in peer.go
 var DefaultObfs = MagicObfsParams{
-	Jc:   5,
+	Jc:   5,
 	Jmin: 60,
 	Jmax: 120,
-	S1:   16,
-	S2:   16,
-	H1:   0xAA,
-	H2:   0xBB,
-	H3:   0xCC,
-	H4:   0xDD,
+	S1:   16,
+	S2:   16,
+	H1:   0xAA,
+	H2:   0xBB,
+	H3:   0xCC,
+	H4:   0xDD,
 }
 
 /* ------ END MAGIC PACKET PARAMS ------ */
 
 type QueueOutboundElement struct {
-	buffer  *[MaxMessageSize]byte // slice holding the packet data
-	packet  []byte                // slice of "buffer" (always!)
-	nonce   uint64                // nonce for encryption
-	keypair *Keypair              // keypair for encryption
-	peer    *Peer                 // related peer
+	buffer  *[MaxMessageSize]byte // slice holding the packet data
+	packet  []byte               // slice of "buffer" (always!)
+	nonce   uint64               // nonce for encryption
+	keypair *Keypair             // keypair for encryption
+	peer    *Peer                // related peer
 }
 
 type QueueOutboundElementsContainer struct {
@@ -86,7 +86,7 @@ func randomInt(min, max int) int {
 	return min + int(n.Int64())
 }
 
-// ارسال پکت Junk به سبک Amnezia
+// Send junk packets in Amnezia style
 func (peer *Peer) sendMagicJunkPackets(header byte) {
 	obfs := peer.Obfs
 	if obfs.Jc <= 0 {
@@ -124,7 +124,7 @@ func (peer *Peer) SendKeepalive() {
 	peer.SendStagedPackets()
 }
 
-// هندشیک INIT با نویز
+// Handshake INIT with noise
 func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	if !isRetry {
 		peer.timers.handshakeAttempts.Store(0)
@@ -143,7 +143,7 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		return nil
 	}
 
-	// ارسال Junk قبل هندشیک
+	// Send Junk before handshake
 	peer.sendMagicJunkPackets(peer.Obfs.H1)
 
 	peer.handshake.lastSentHandshake = time.Now()
@@ -159,7 +159,7 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	// Access the underlying byte slice
 	msg := msgStruct.Bytes
 
-	// افزودن هدر و Junk
+	// Add header and Junk
 	obfs := peer.Obfs
 	totalLen := 1 + len(msg)
 	if obfs.S1 > 0 {
@@ -184,13 +184,13 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	return err
 }
 
-// هندشیک Response با نویز
-func (peer *Peer) SendHandshakeResponse() error { // Remove the duplicate declaration
+// Handshake Response with noise
+func (peer *Peer) SendHandshakeResponse() error {
 	peer.handshake.mutex.Lock()
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
 
-	// ارسال Junk قبل Response
+	// Send Junk before Response
 	peer.sendMagicJunkPackets(peer.Obfs.H2)
 
 	peer.device.log.Verbosef("%v - Sending handshake response", peer)
@@ -227,7 +227,7 @@ func (peer *Peer) SendHandshakeResponse() error { // Remove the duplicate declar
 	peer.timersAnyAuthenticatedPacketSent()
 	err = peer.SendBuffers([][]byte{packet}, false)
 	if err != nil {
-		peer.device.log.Errorf("%v - Failed to send handshake response: %l", peer, err) // Fixed typo here
+		peer.device.log.Errorf("%v - Failed to send handshake response: %v", peer, err)
 	}
 	return err
 }
@@ -271,14 +271,14 @@ func (device *Device) RoutineReadFromTUN() {
 	device.log.Verbosef("Routine: TUN reader - started")
 
 	var (
-		batchSize   = device.BatchSize()
-		readErr     error
-		elems       = make([]*QueueOutboundElement, batchSize)
-		bufs        = make([][]byte, batchSize)
+		batchSize   = device.BatchSize()
+		readErr     error
+		elems       = make([]*QueueOutboundElement, batchSize)
+		bufs        = make([][]byte, batchSize)
 		elemsByPeer = make(map[*Peer]*QueueOutboundElementsContainer, batchSize)
-		count       = 0
-		sizes       = make([]int, batchSize)
-		offset      = MessageTransportHeaderSize
+		count       = 0
+		sizes       = make([]int, batchSize)
+		offset      = MessageTransportHeaderSize
 	)
 
 	for i := range elems {
@@ -490,10 +490,10 @@ func calculatePaddingSize(packetSize, mtu int) int {
 }
 
 /* Encrypts the elements in the queue
- * and marks them for sequential consumption (by releasing the mutex)
- *
- * Obs. One instance per core
- */
+ * and marks them for sequential consumption (by releasing the mutex)
+ *
+ * Obs. One instance per core
+ */
 func (device *Device) RoutineEncryption(id int) {
 	var paddingZeros [PaddingMultiple]byte
 	var nonce [chacha20poly1305.NonceSize]byte
