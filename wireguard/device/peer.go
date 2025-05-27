@@ -16,6 +16,7 @@ import (
 )
 
 type Peer struct {
+	    Obfs MagicObfsParams
 	isRunning         atomic.Bool
 	keypairs          Keypairs
 	handshake         Handshake
