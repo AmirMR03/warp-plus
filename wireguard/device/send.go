@@ -1,8 +1,3 @@
-/* SPDX-License-Identifier: MIT
- *
- * Copyright (C) 2017-2023 WireGuard LLC. All Rights Reserved.
- */
-
 package device
 
 import (
@@ -23,29 +18,34 @@ import (
 	"golang.org/x/net/ipv6"
 )
 
-/* Outbound flow
- *
- * 1. TUN queue
- * 2. Routing (sequential)
- * 3. Nonce assignment (sequential)
- * 4. Encryption (parallel)
- * 5. Transmission (sequential)
- *
- * The functions in this file occur (roughly) in the order in
- * which the packets are processed.
- *
- * Locking, Producers and Consumers
- *
- * The order of packets (per peer) must be maintained,
- * but encryption of packets happen out-of-order:
- *
- * The sequential consumers will attempt to take the lock,
- * workers release lock when they have completed work (encryption) on the packet.
- *
- * If the element is inserted into the "encryption queue",
- * the content is preceded by enough "junk" to contain the transport header
- * (to allow the construction of transport messages in-place)
- */
+/* ------ MAGIC PACKET PARAMS & UTILS ------ */
+
+type MagicObfsParams struct {
+	Jc   int   // Junk packet count
+	Jmin int   // Junk packet min size
+	Jmax int   // Junk packet max size
+	S1   int   // Init packet junk size
+	S2   int   // Response packet junk size
+	H1   byte  // Init magic header
+	H2   byte  // Response magic header
+	H3   byte  // Underload header (برای دیتا اگر خواستی)
+	H4   byte  // Transport header (برای دیتا اگر خواستی)
+}
+
+// مقدار تستی، مقداردهی واقعی را باید در peer.go انجام دهی
+var DefaultObfs = MagicObfsParams{
+	Jc:   5,
+	Jmin: 60,
+	Jmax: 120,
+	S1:   16,
+	S2:   16,
+	H1:   0xAA,
+	H2:   0xBB,
+	H3:   0xCC,
+	H4:   0xDD,
+}
+
+/* ------ END MAGIC PACKET PARAMS ------ */
 
 type QueueOutboundElement struct {
 	buffer  *[MaxMessageSize]byte // slice holding the packet data
@@ -68,10 +68,6 @@ func (device *Device) NewOutboundElement() *QueueOutboundElement {
 	return elem
 }
 
-// clearPointers clears elem fields that contain pointers.
-// This makes the garbage collector's life easier and
-// avoids accidentally keeping other objects around unnecessarily.
-// It also reduces the possible collateral damage from use-after-free bugs.
 func (elem *QueueOutboundElement) clearPointers() {
 	elem.buffer = nil
 	elem.packet = nil
@@ -79,81 +75,40 @@ func (elem *QueueOutboundElement) clearPointers() {
 	elem.peer = nil
 }
 
-func randomInt(min, max uint64) uint64 {
-	rangee := max - min
-	if rangee < 1 {
-		return 0
+func randomInt(min, max int) int {
+	if max <= min {
+		return min
 	}
-
-	n, err := rand.Int(rand.Reader, big.NewInt(int64(rangee)))
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(max-min+1)))
 	if err != nil {
-		panic(err)
+		return min
 	}
-
-	return min + n.Uint64()
+	return min + int(n.Int64())
 }
 
-func (peer *Peer) sendRandomPackets() {
-	var Wheader = []byte{}
-	switch peer.trick {
-	case "t1":
-	case "t2":
-		clist := []byte{0xDC, 0xDE, 0xD3, 0xD9, 0xD0, 0xEC, 0xEE, 0xE3}
-		Wheader = []byte{
-			clist[randomInt(0, uint64(len(clist)-1))],
-			0x00, 0x00, 0x00, 0x01, 0x08,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x44, 0xD0,
-		}
-		_, err := rand.Read(Wheader[6:14])
-		if err != nil {
-			panic(err)
-		}
-	// default:
-	// 	if len(tm)%2 != 0 {
-	// 		tm = tm + "0"
-	// 	}
-	// 	decodedBytes, err := hex.DecodeString(tm)
-	// 	if err == nil {
-	// 		Wheader = decodedBytes
-	// 	}
-	default:
+// ارسال پکت Junk به سبک Amnezia
+func (peer *Peer) sendMagicJunkPackets(header byte) {
+	obfs := peer.Obfs
+	if obfs.Jc <= 0 {
 		return
 	}
-
-	numPackets := randomInt(20, 50)
-	maxpLen := uint64(len(Wheader) + 120)
-	randomPacket := make([]byte, maxpLen)
-	for i := uint64(0); i < numPackets; i++ {
-		if peer.device.isClosed() || !peer.isRunning.Load() {
-			return
+	for i := 0; i < obfs.Jc; i++ {
+		size := randomInt(obfs.Jmin, obfs.Jmax)
+		if size < 1 {
+			size = obfs.Jmin
 		}
-
-		packetSize := randomInt(uint64(len(Wheader)+10), maxpLen)
-		_, err := rand.Read(randomPacket[len(Wheader):packetSize])
-		if err != nil {
-			return
+		buf := make([]byte, size)
+		buf[0] = header
+		if size > 1 {
+			rand.Read(buf[1:])
 		}
-		copy(randomPacket[0:], Wheader)
-
-		err = peer.SendBuffers([][]byte{randomPacket[:packetSize]}, true)
-		if err != nil {
-			return
-		}
-
-		time.Sleep(time.Duration(randomInt(80, 150)) * time.Millisecond)
+		peer.SendBuffers([][]byte{buf}, true)
+		time.Sleep(time.Duration(10+randomInt(0, 30)) * time.Millisecond)
 	}
 }
 
-/* Queues a keepalive if no packets are queued for peer
- */
 func (peer *Peer) SendKeepalive() {
 	if len(peer.queue.staged) == 0 && peer.isRunning.Load() {
-		if peer.trick != "" && peer.trick != "t0" {
-			peer.device.log.Verbosef("%v - Running tricks! (keepalive)", peer)
-			peer.sendRandomPackets()
-		}
-
 		elem := peer.device.NewOutboundElement()
 		elemsContainer := peer.device.GetOutboundElementsContainer()
 		elemsContainer.elems = append(elemsContainer.elems, elem)
@@ -169,6 +124,7 @@ func (peer *Peer) SendKeepalive() {
 	peer.SendStagedPackets()
 }
 
+// هندشیک INIT با نویز
 func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	if !isRetry {
 		peer.timers.handshakeAttempts.Store(0)
@@ -187,14 +143,11 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		return nil
 	}
 
-	if peer.trick != "" && peer.trick != "t0" {
-		peer.device.log.Verbosef("%v - Running tricks! (handshake)", peer)
-		peer.sendRandomPackets()
-	}
+	// ارسال Junk قبل هندشیک
+	peer.sendMagicJunkPackets(peer.Obfs.H1)
 
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
-
 	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
 
 	msg, err := peer.device.CreateMessageInitiation(peer)
@@ -203,43 +156,60 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		return err
 	}
 
-	var buf [MessageInitiationSize]byte
-	writer := bytes.NewBuffer(buf[:0])
-	binary.Write(writer, binary.LittleEndian, msg)
-	packet := writer.Bytes()
+	// افزودن هدر و Junk
+	obfs := peer.Obfs
+	totalLen := 1 + len(msg)
+	if obfs.S1 > 0 {
+		totalLen += obfs.S1
+	}
+	buf := make([]byte, totalLen)
+	buf[0] = obfs.H1
+	copy(buf[1:], msg[:])
+	if obfs.S1 > 0 {
+		rand.Read(buf[1+len(msg):])
+	}
+	packet := buf
 	peer.cookieGenerator.AddMacs(packet)
 
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
-
 	err = peer.SendBuffers([][]byte{packet}, false)
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
 	}
 	peer.timersHandshakeInitiated()
-
 	return err
 }
 
+// هندشیک Response با نویز
 func (peer *Peer) SendHandshakeResponse() error {
 	peer.handshake.mutex.Lock()
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
 
-	peer.device.log.Verbosef("%v - Sending handshake response", peer)
+	// ارسال Junk قبل Response
+	peer.sendMagicJunkPackets(peer.Obfs.H2)
 
+	peer.device.log.Verbosef("%v - Sending handshake response", peer)
 	response, err := peer.device.CreateMessageResponse(peer)
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to create response message: %v", peer, err)
 		return err
 	}
 
-	var buf [MessageResponseSize]byte
-	writer := bytes.NewBuffer(buf[:0])
-	binary.Write(writer, binary.LittleEndian, response)
-	packet := writer.Bytes()
+	obfs := peer.Obfs
+	totalLen := 1 + len(response)
+	if obfs.S2 > 0 {
+		totalLen += obfs.S2
+	}
+	buf := make([]byte, totalLen)
+	buf[0] = obfs.H2
+	copy(buf[1:], response[:])
+	if obfs.S2 > 0 {
+		rand.Read(buf[1+len(response):])
+	}
+	packet := buf
 	peer.cookieGenerator.AddMacs(packet)
-
 	err = peer.BeginSymmetricSession()
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to derive keypair: %v", peer, err)
@@ -249,15 +219,12 @@ func (peer *Peer) SendHandshakeResponse() error {
 	peer.timersSessionDerived()
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
-
-	// TODO: allocation could be avoided
 	err = peer.SendBuffers([][]byte{packet}, false)
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to send handshake response: %v", peer, err)
 	}
 	return err
 }
-
 func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement) error {
 	device.log.Verbosef("Sending cookie response for denied handshake message for %v", initiatingElem.endpoint.DstToString())
 
