@@ -126,61 +126,123 @@ func (peer *Peer) SendKeepalive() {
 
 // هندشیک INIT با نویز
 func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
-	if !isRetry {
-		peer.timers.handshakeAttempts.Store(0)
-	}
+    if !isRetry {
+        peer.timers.handshakeAttempts.Store(0)
+    }
 
-	peer.handshake.mutex.RLock()
-	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
-		peer.handshake.mutex.RUnlock()
-		return nil
-	}
-	peer.handshake.mutex.RUnlock()
+    peer.handshake.mutex.RLock()
+    if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
+        peer.handshake.mutex.RUnlock()
+        return nil
+    }
+    peer.handshake.mutex.RUnlock()
 
-	peer.handshake.mutex.Lock()
-	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
-		peer.handshake.mutex.Unlock()
-		return nil
-	}
+    peer.handshake.mutex.Lock()
+    if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
+        peer.handshake.mutex.Unlock()
+        return nil
+    }
 
-	// ارسال Junk قبل هندشیک
-	peer.sendMagicJunkPackets(peer.Obfs.H1)
+    // ارسال Junk قبل هندشیک
+    peer.sendMagicJunkPackets(peer.Obfs.H1)
 
-	peer.handshake.lastSentHandshake = time.Now()
-	peer.handshake.mutex.Unlock()
-	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
+    peer.handshake.lastSentHandshake = time.Now()
+    peer.handshake.mutex.Unlock()
+    peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
 
-	msg, err := peer.device.CreateMessageInitiation(peer)
-	if err != nil {
-		peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
-		return err
-	}
+    msg, err := peer.device.CreateMessageInitiation(peer)
+    if err != nil {
+        peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
+        return err
+    }
 
-	// افزودن هدر و Junk
-	obfs := peer.Obfs
-	totalLen := 1 + len(msg)
-	if obfs.S1 > 0 {
-		totalLen += obfs.S1
-	}
-	buf := make([]byte, totalLen)
-	buf[0] = obfs.H1
-	copy(buf[1:], msg[:])
-	if obfs.S1 > 0 {
-		rand.Read(buf[1+len(msg):])
-	}
-	packet := buf
-	peer.cookieGenerator.AddMacs(packet)
+    var msgBytes []byte
+    // اگر msg خودش []byte است نیازی به Marshal نیست
+    switch m := msg.(type) {
+    case []byte:
+        msgBytes = m
+    case interface{ Marshal() []byte }:
+        msgBytes = m.Marshal()
+    default:
+        panic("MessageInitiation does not implement Marshal() []byte")
+    }
 
-	peer.timersAnyAuthenticatedPacketTraversal()
-	peer.timersAnyAuthenticatedPacketSent()
-	err = peer.SendBuffers([][]byte{packet}, false)
-	if err != nil {
-		peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
-	}
-	peer.timersHandshakeInitiated()
-	return err
+    obfs := peer.Obfs
+    totalLen := 1 + len(msgBytes)
+    if obfs.S1 > 0 {
+        totalLen += obfs.S1
+    }
+    buf := make([]byte, totalLen)
+    buf[0] = obfs.H1
+    copy(buf[1:], msgBytes)
+    if obfs.S1 > 0 {
+        rand.Read(buf[1+len(msgBytes):])
+    }
+    packet := buf
+    peer.cookieGenerator.AddMacs(packet)
+
+    peer.timersAnyAuthenticatedPacketTraversal()
+    peer.timersAnyAuthenticatedPacketSent()
+    err = peer.SendBuffers([][]byte{packet}, false)
+    if err != nil {
+        peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
+    }
+    peer.timersHandshakeInitiated()
+    return err
 }
 
+func (peer *Peer) SendHandshakeResponse() error {
+    peer.handshake.mutex.Lock()
+    peer.handshake.lastSentHandshake = time.Now()
+    peer.handshake.mutex.Unlock()
+
+    peer.sendMagicJunkPackets(peer.Obfs.H2)
+
+    peer.device.log.Verbosef("%v - Sending handshake response", peer)
+    response, err := peer.device.CreateMessageResponse(peer)
+    if err != nil {
+        peer.device.log.Errorf("%v - Failed to create response message: %v", peer, err)
+        return err
+    }
+
+    var responseBytes []byte
+    switch r := response.(type) {
+    case []byte:
+        responseBytes = r
+    case interface{ Marshal() []byte }:
+        responseBytes = r.Marshal()
+    default:
+        panic("MessageResponse does not implement Marshal() []byte")
+    }
+
+    obfs := peer.Obfs
+    totalLen := 1 + len(responseBytes)
+    if obfs.S2 > 0 {
+        totalLen += obfs.S2
+    }
+    buf := make([]byte, totalLen)
+    buf[0] = obfs.H2
+    copy(buf[1:], responseBytes)
+    if obfs.S2 > 0 {
+        rand.Read(buf[1+len(responseBytes):])
+    }
+    packet := buf
+    peer.cookieGenerator.AddMacs(packet)
+    err = peer.BeginSymmetricSession()
+    if err != nil {
+        peer.device.log.Errorf("%v - Failed to derive keypair: %v", peer, err)
+        return err
+    }
+
+    peer.timersSessionDerived()
+    peer.timersAnyAuthenticatedPacketTraversal()
+    peer.timersAnyAuthenticatedPacketSent()
+    err = peer.SendBuffers([][]byte{packet}, false)
+    if err != nil {
+        peer.device.log.Errorf("%v - Failed to send handshake response: %v", peer, err)
+    }
+    return err
+}
 // هندشیک Response با نویز
 func (peer *Peer) SendHandshakeResponse() error {
 	peer.handshake.mutex.Lock()
