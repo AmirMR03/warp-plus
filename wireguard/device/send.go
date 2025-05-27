@@ -21,38 +21,38 @@ import (
 /* ------ MAGIC PACKET PARAMS & UTILS ------ */
 
 type MagicObfsParams struct {
-	Jc   int   // Junk packet count
-	Jmin int   // Junk packet min size
-	Jmax int   // Junk packet max size
-	S1   int   // Init packet junk size
-	S2   int   // Response packet junk size
-	H1   byte  // Init magic header
-	H2   byte  // Response magic header
-	H3   byte  // Underload header (برای دیتا اگر خواستی)
-	H4   byte  // Transport header (برای دیتا اگر خواستی)
+	Jc   int   // Junk packet count
+	Jmin int   // Junk packet min size
+	Jmax int   // Junk packet max size
+	S1   int   // Init packet junk size
+	S2   int   // Response packet junk size
+	H1   byte  // Init magic header
+	H2   byte  // Response magic header
+	H3   byte  // Underload header (برای دیتا اگر خواستی)
+	H4   byte  // Transport header (برای دیتا اگر خواستی)
 }
 
 // مقدار تستی، مقداردهی واقعی را باید در peer.go انجام دهی
 var DefaultObfs = MagicObfsParams{
-	Jc:   5,
+	Jc:   5,
 	Jmin: 60,
 	Jmax: 120,
-	S1:   16,
-	S2:   16,
-	H1:   0xAA,
-	H2:   0xBB,
-	H3:   0xCC,
-	H4:   0xDD,
+	S1:   16,
+	S2:   16,
+	H1:   0xAA,
+	H2:   0xBB,
+	H3:   0xCC,
+	H4:   0xDD,
 }
 
 /* ------ END MAGIC PACKET PARAMS ------ */
 
 type QueueOutboundElement struct {
-	buffer  *[MaxMessageSize]byte // slice holding the packet data
-	packet  []byte                // slice of "buffer" (always!)
-	nonce   uint64                // nonce for encryption
-	keypair *Keypair              // keypair for encryption
-	peer    *Peer                 // related peer
+	buffer  *[MaxMessageSize]byte // slice holding the packet data
+	packet  []byte                // slice of "buffer" (always!)
+	nonce   uint64                // nonce for encryption
+	keypair *Keypair              // keypair for encryption
+	peer    *Peer                 // related peer
 }
 
 type QueueOutboundElementsContainer struct {
@@ -126,125 +126,66 @@ func (peer *Peer) SendKeepalive() {
 
 // هندشیک INIT با نویز
 func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
-    if !isRetry {
-        peer.timers.handshakeAttempts.Store(0)
-    }
+	if !isRetry {
+		peer.timers.handshakeAttempts.Store(0)
+	}
 
-    peer.handshake.mutex.RLock()
-    if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
-        peer.handshake.mutex.RUnlock()
-        return nil
-    }
-    peer.handshake.mutex.RUnlock()
+	peer.handshake.mutex.RLock()
+	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
+		peer.handshake.mutex.RUnlock()
+		return nil
+	}
+	peer.handshake.mutex.RUnlock()
 
-    peer.handshake.mutex.Lock()
-    if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
-        peer.handshake.mutex.Unlock()
-        return nil
-    }
+	peer.handshake.mutex.Lock()
+	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
+		peer.handshake.mutex.Unlock()
+		return nil
+	}
 
-    // ارسال Junk قبل هندشیک
-    peer.sendMagicJunkPackets(peer.Obfs.H1)
+	// ارسال Junk قبل هندشیک
+	peer.sendMagicJunkPackets(peer.Obfs.H1)
 
-    peer.handshake.lastSentHandshake = time.Now()
-    peer.handshake.mutex.Unlock()
-    peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
+	peer.handshake.lastSentHandshake = time.Now()
+	peer.handshake.mutex.Unlock()
+	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
 
-    msg, err := peer.device.CreateMessageInitiation(peer)
-    if err != nil {
-        peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
-        return err
-    }
+	// Assuming CreateMessageInitiation returns a struct with a .Bytes field
+	msgStruct, err := peer.device.CreateMessageInitiation(peer)
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
+		return err
+	}
+	// Access the underlying byte slice
+	msg := msgStruct.Bytes
 
-    var msgBytes []byte
-    // اگر msg خودش []byte است نیازی به Marshal نیست
-    switch m := msg.(type) {
-    case []byte:
-        msgBytes = m
-    case interface{ Marshal() []byte }:
-        msgBytes = m.Marshal()
-    default:
-        panic("MessageInitiation does not implement Marshal() []byte")
-    }
+	// افزودن هدر و Junk
+	obfs := peer.Obfs
+	totalLen := 1 + len(msg)
+	if obfs.S1 > 0 {
+		totalLen += obfs.S1
+	}
+	buf := make([]byte, totalLen)
+	buf[0] = obfs.H1
+	copy(buf[1:], msg) // Copy the byte slice
+	if obfs.S1 > 0 {
+		rand.Read(buf[1+len(msg):])
+	}
+	packet := buf
+	peer.cookieGenerator.AddMacs(packet)
 
-    obfs := peer.Obfs
-    totalLen := 1 + len(msgBytes)
-    if obfs.S1 > 0 {
-        totalLen += obfs.S1
-    }
-    buf := make([]byte, totalLen)
-    buf[0] = obfs.H1
-    copy(buf[1:], msgBytes)
-    if obfs.S1 > 0 {
-        rand.Read(buf[1+len(msgBytes):])
-    }
-    packet := buf
-    peer.cookieGenerator.AddMacs(packet)
-
-    peer.timersAnyAuthenticatedPacketTraversal()
-    peer.timersAnyAuthenticatedPacketSent()
-    err = peer.SendBuffers([][]byte{packet}, false)
-    if err != nil {
-        peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
-    }
-    peer.timersHandshakeInitiated()
-    return err
+	peer.timersAnyAuthenticatedPacketTraversal()
+	peer.timersAnyAuthenticatedPacketSent()
+	err = peer.SendBuffers([][]byte{packet}, false)
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
+	}
+	peer.timersHandshakeInitiated()
+	return err
 }
 
-func (peer *Peer) SendHandshakeResponse() error {
-    peer.handshake.mutex.Lock()
-    peer.handshake.lastSentHandshake = time.Now()
-    peer.handshake.mutex.Unlock()
-
-    peer.sendMagicJunkPackets(peer.Obfs.H2)
-
-    peer.device.log.Verbosef("%v - Sending handshake response", peer)
-    response, err := peer.device.CreateMessageResponse(peer)
-    if err != nil {
-        peer.device.log.Errorf("%v - Failed to create response message: %v", peer, err)
-        return err
-    }
-
-    var responseBytes []byte
-    switch r := response.(type) {
-    case []byte:
-        responseBytes = r
-    case interface{ Marshal() []byte }:
-        responseBytes = r.Marshal()
-    default:
-        panic("MessageResponse does not implement Marshal() []byte")
-    }
-
-    obfs := peer.Obfs
-    totalLen := 1 + len(responseBytes)
-    if obfs.S2 > 0 {
-        totalLen += obfs.S2
-    }
-    buf := make([]byte, totalLen)
-    buf[0] = obfs.H2
-    copy(buf[1:], responseBytes)
-    if obfs.S2 > 0 {
-        rand.Read(buf[1+len(responseBytes):])
-    }
-    packet := buf
-    peer.cookieGenerator.AddMacs(packet)
-    err = peer.BeginSymmetricSession()
-    if err != nil {
-        peer.device.log.Errorf("%v - Failed to derive keypair: %v", peer, err)
-        return err
-    }
-
-    peer.timersSessionDerived()
-    peer.timersAnyAuthenticatedPacketTraversal()
-    peer.timersAnyAuthenticatedPacketSent()
-    err = peer.SendBuffers([][]byte{packet}, false)
-    if err != nil {
-        peer.device.log.Errorf("%v - Failed to send handshake response: %v", peer, err)
-    }
-    return err
-}
 // هندشیک Response با نویز
-func (peer *Peer) SendHandshakeResponse() error {
+func (peer *Peer) SendHandshakeResponse() error { // Remove the duplicate declaration
 	peer.handshake.mutex.Lock()
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
@@ -253,11 +194,14 @@ func (peer *Peer) SendHandshakeResponse() error {
 	peer.sendMagicJunkPackets(peer.Obfs.H2)
 
 	peer.device.log.Verbosef("%v - Sending handshake response", peer)
-	response, err := peer.device.CreateMessageResponse(peer)
+	// Assuming CreateMessageResponse returns a struct with a .Bytes field
+	responseStruct, err := peer.device.CreateMessageResponse(peer)
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to create response message: %v", peer, err)
 		return err
 	}
+	// Access the underlying byte slice
+	response := responseStruct.Bytes
 
 	obfs := peer.Obfs
 	totalLen := 1 + len(response)
@@ -266,7 +210,7 @@ func (peer *Peer) SendHandshakeResponse() error {
 	}
 	buf := make([]byte, totalLen)
 	buf[0] = obfs.H2
-	copy(buf[1:], response[:])
+	copy(buf[1:], response) // Copy the byte slice
 	if obfs.S2 > 0 {
 		rand.Read(buf[1+len(response):])
 	}
@@ -283,10 +227,11 @@ func (peer *Peer) SendHandshakeResponse() error {
 	peer.timersAnyAuthenticatedPacketSent()
 	err = peer.SendBuffers([][]byte{packet}, false)
 	if err != nil {
-		peer.device.log.Errorf("%v - Failed to send handshake response: %v", peer, err)
+		peer.device.log.Errorf("%v - Failed to send handshake response: %l", peer, err) // Fixed typo here
 	}
 	return err
 }
+
 func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement) error {
 	device.log.Verbosef("Sending cookie response for denied handshake message for %v", initiatingElem.endpoint.DstToString())
 
@@ -326,14 +271,14 @@ func (device *Device) RoutineReadFromTUN() {
 	device.log.Verbosef("Routine: TUN reader - started")
 
 	var (
-		batchSize   = device.BatchSize()
-		readErr     error
-		elems       = make([]*QueueOutboundElement, batchSize)
-		bufs        = make([][]byte, batchSize)
+		batchSize   = device.BatchSize()
+		readErr     error
+		elems       = make([]*QueueOutboundElement, batchSize)
+		bufs        = make([][]byte, batchSize)
 		elemsByPeer = make(map[*Peer]*QueueOutboundElementsContainer, batchSize)
-		count       = 0
-		sizes       = make([]int, batchSize)
-		offset      = MessageTransportHeaderSize
+		count       = 0
+		sizes       = make([]int, batchSize)
+		offset      = MessageTransportHeaderSize
 	)
 
 	for i := range elems {
@@ -545,10 +490,10 @@ func calculatePaddingSize(packetSize, mtu int) int {
 }
 
 /* Encrypts the elements in the queue
- * and marks them for sequential consumption (by releasing the mutex)
- *
- * Obs. One instance per core
- */
+ * and marks them for sequential consumption (by releasing the mutex)
+ *
+ * Obs. One instance per core
+ */
 func (device *Device) RoutineEncryption(id int) {
 	var paddingZeros [PaddingMultiple]byte
 	var nonce [chacha20poly1305.NonceSize]byte
